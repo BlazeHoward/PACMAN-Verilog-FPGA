@@ -1,0 +1,66 @@
+`timescale 1ns / 1ps
+
+module SevenSegDisplay (
+    input  wire        clk,          // 100MHz 系统时钟
+    input  wire        rst_n,
+    input  wire [15:0] score_bcd,    // 16位BCD，每4位代表一个十进制位（千、百、十、个）
+    input  wire [1:0]  lives,        // 剩余生命（0~3）
+    output reg  [6:0]  seg,          // 七段码 {g,f,e,d,c,b,a} 低有效
+    output reg  [7:0]  an            // 位选信号，低有效（共阴极数码管）
+);
+
+    // 动态扫描分频：产生约 500Hz 扫描频率（每个数码管 1/500=2ms，人眼无闪烁）
+    // 100MHz / 2^18 ≈ 381Hz，略微偏低但足够；取 2^17 = 131072 → 约763Hz，更佳。
+    localparam SCAN_DIV = 17;          // 2^17 = 131072 ≈ 763Hz
+    reg [SCAN_DIV-1:0] scan_cnt;
+    reg [2:0]          scan_sel;      // 0~7
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            scan_cnt <= 0;
+            scan_sel <= 0;
+        end else if (&scan_cnt) begin   // 计数全1时加1
+            scan_sel <= scan_sel + 1'b1;
+            scan_cnt <= 0;
+        end else begin
+            scan_cnt <= scan_cnt + 1'b1;
+        end
+    end
+
+    // 根据 scan_sel 选择当前显示的数值
+    reg [3:0] cur_num;
+    always @(*) begin
+        case (scan_sel)
+            3'd0: cur_num = score_bcd[3:0];      // 个位
+            3'd1: cur_num = score_bcd[7:4];      // 十位
+            3'd2: cur_num = score_bcd[11:8];     // 百位
+            3'd3: cur_num = score_bcd[15:12];    // 千位
+            3'd4: cur_num = {2'b0, lives};       // 生命值 (0~3)
+            default: cur_num = 4'hF;              // 不显示（全灭）
+        endcase
+    end
+
+    // BCD 转七段码（共阴极，低电平点亮）
+    always @(*) begin
+        case (cur_num)
+            4'h0: seg = 7'b1000000; // 0
+            4'h1: seg = 7'b1111001; // 1
+            4'h2: seg = 7'b0100100; // 2
+            4'h3: seg = 7'b0110000; // 3
+            4'h4: seg = 7'b0011001; // 4
+            4'h5: seg = 7'b0010010; // 5
+            4'h6: seg = 7'b0000010; // 6
+            4'h7: seg = 7'b1111000; // 7
+            4'h8: seg = 7'b0000000; // 8
+            4'h9: seg = 7'b0010000; // 9
+            default: seg = 7'b1111111; // 全灭
+        endcase
+    end
+
+    // 位选信号（低有效）
+    always @(*) begin
+        an = 8'b11111111;
+        an[scan_sel] = 1'b0;   // 当前选中的数码管点亮
+    end
+
+endmodule

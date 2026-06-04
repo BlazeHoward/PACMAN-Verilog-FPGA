@@ -1,0 +1,326 @@
+`timescale 1ns / 1ps
+`include "game_defines.v"
+
+module VGA_Renderer #(
+    parameter BLOCK_SIZE = 16
+)(
+    input  wire        clk_100M,
+    input  wire        rst_n,
+    input  wire [1:0]  difficulty,
+
+    output wire [4:0]  vga_addr_x,
+    output wire [4:0]  vga_addr_y,
+    input  wire [2:0]  vga_map_data,
+
+    input  wire [4:0]  pac_x, pac_y,
+    input  wire [4:0]  ghost0_x, ghost0_y,
+    input  wire [4:0]  ghost1_x, ghost1_y,
+    input  wire [4:0]  ghost2_x, ghost2_y,
+    input  wire [4:0]  ghost3_x, ghost3_y,
+    input  wire        power_active,
+    input  wire        pill_blink,
+    input  wire [2:0]  game_state,
+
+    output wire        vga_clk_out,
+    output wire        vga_hs, 
+    output wire        vga_vs,
+    output wire        vga_blank_n,
+    output wire        vga_sync_n,
+    output reg  [7:0]  vga_r,
+    output reg  [7:0]  vga_g,
+    output reg  [7:0]  vga_b
+);
+
+    //========================================================================
+    // 1. pixel_en 每4拍一次 (25MHz)
+    //========================================================================
+    reg [1:0] clk_div;
+    wire pixel_en = (clk_div == 2'b11);
+    always @(posedge clk_100M or negedge rst_n) 
+        if (!rst_n) clk_div <= 0; else clk_div <= clk_div + 1;
+    assign vga_clk_out = pixel_en;
+
+    //========================================================================
+    // 2. VGA 时序参数
+    //========================================================================
+    localparam H_SYNC=96, H_BACK=48, H_DISP=640, H_FRONT=16, H_TOTAL=800;
+    localparam V_SYNC=2,  V_BACK=33, V_DISP=480, V_FRONT=10, V_TOTAL=525;
+
+    //========================================================================
+    // 3. 居中偏移
+    //========================================================================
+    localparam BLOCK_SHIFT = 4;
+    wire [9:0] game_w = (difficulty==2'd2) ? 304 : (difficulty==2'd1) ? 240 : 128;
+    wire [9:0] game_h = (difficulty==2'd2) ? 336 : (difficulty==2'd1) ? 240 : 128;
+    wire [9:0] offset_x = (640 - game_w) >> 1;
+    wire [9:0] offset_y = (480 - game_h) >> 1;
+
+    //========================================================================
+    // 4. 扫描计数器
+    //========================================================================
+    reg [9:0] h_cnt, v_cnt;
+    always @(posedge clk_100M or negedge rst_n) begin
+        if (!rst_n) begin h_cnt <= 0; v_cnt <= 0; end
+        else if (pixel_en) begin
+            if (h_cnt == H_TOTAL-1) begin
+                h_cnt <= 0;
+                v_cnt <= (v_cnt == V_TOTAL-1) ? 0 : v_cnt + 1;
+            end else h_cnt <= h_cnt + 1;
+        end
+    end
+
+    //========================================================================
+    // 5. 同步信号
+    //========================================================================
+    reg vga_hs_r, vga_vs_r, video_en_r;
+    always @(posedge clk_100M or negedge rst_n) begin
+        if (!rst_n) begin vga_hs_r <= 1; vga_vs_r <= 1; video_en_r <= 0; end
+        else if (pixel_en) begin
+            vga_hs_r <= (h_cnt >= H_SYNC);
+            vga_vs_r <= (v_cnt >= V_SYNC);
+            video_en_r <= (h_cnt>=H_SYNC+H_BACK) && (h_cnt<H_SYNC+H_BACK+H_DISP)
+                       && (v_cnt>=V_SYNC+V_BACK) && (v_cnt<V_SYNC+V_BACK+V_DISP);
+        end
+    end
+    assign vga_hs = vga_hs_r; assign vga_vs = vga_vs_r;
+    assign vga_blank_n = video_en_r; assign vga_sync_n = 0;
+
+    //========================================================================
+    // 6. 像素坐标与网格
+    //========================================================================
+    wire [9:0] pixel_x = video_en_r ? (h_cnt - H_SYNC - H_BACK) : 0;
+    wire [9:0] pixel_y = video_en_r ? (v_cnt - V_SYNC - V_BACK) : 0;
+    wire in_game_area = (pixel_x>=offset_x) && (pixel_x<offset_x+game_w)
+                     && (pixel_y>=offset_y) && (pixel_y<offset_y+game_h);
+    wire [4:0] grid_x = in_game_area ? ((pixel_x-offset_x)>>BLOCK_SHIFT) : 0;
+    wire [4:0] grid_y = in_game_area ? ((pixel_y-offset_y)>>BLOCK_SHIFT) : 0;
+
+    assign vga_addr_x = grid_x;
+    assign vga_addr_y = grid_y;
+
+    //========================================================================
+    // 7. 延迟链 (DLY=4 匹配 MAP)
+    //========================================================================
+    localparam DLY = 4;
+    integer i;
+
+    // 地图数据延迟链
+    reg [2:0] map_d [0:DLY-1];
+    always @(posedge clk_100M or negedge rst_n) begin
+        if (!rst_n) begin: rst_map for (i=0; i<DLY; i=i+1) map_d[i] <= 0; end
+        else begin map_d[0] <= vga_map_data; for (i=1; i<DLY; i=i+1) map_d[i] <= map_d[i-1]; end
+    end
+    wire [2:0] vga_map_data_r = map_d[DLY-1];
+
+    // 9bit 信号延迟链
+    reg [9:0] px_d [0:DLY-1], py_d [0:DLY-1], offx_d [0:DLY-1], offy_d [0:DLY-1];
+    always @(posedge clk_100M or negedge rst_n) begin
+        if (!rst_n) begin: rst_9b
+            for (i=0; i<DLY; i=i+1) begin px_d[i]<=0; py_d[i]<=0; offx_d[i]<=0; offy_d[i]<=0; end
+        end else begin
+            px_d[0] <= pixel_x;   for (i=1; i<DLY; i=i+1) px_d[i] <= px_d[i-1];
+            py_d[0] <= pixel_y;   for (i=1; i<DLY; i=i+1) py_d[i] <= py_d[i-1];
+            offx_d[0] <= offset_x; for (i=1; i<DLY; i=i+1) offx_d[i] <= offx_d[i-1];
+            offy_d[0] <= offset_y; for (i=1; i<DLY; i=i+1) offy_d[i] <= offy_d[i-1];
+        end
+    end
+    wire [9:0] pixel_x_r = px_d[DLY-1], pixel_y_r = py_d[DLY-1];
+    wire [9:0] offset_x_r = offx_d[DLY-1], offset_y_r = offy_d[DLY-1];
+
+    // 5bit 信号延迟链
+    reg [4:0] gx_d [0:DLY-1], gy_d [0:DLY-1];
+    reg [4:0] pacx_d [0:DLY-1], pacy_d [0:DLY-1];
+    reg [4:0] gh0x_d [0:DLY-1], gh0y_d [0:DLY-1];
+    reg [4:0] gh1x_d [0:DLY-1], gh1y_d [0:DLY-1];
+    reg [4:0] gh2x_d [0:DLY-1], gh2y_d [0:DLY-1];
+    reg [4:0] gh3x_d [0:DLY-1], gh3y_d [0:DLY-1];
+    always @(posedge clk_100M or negedge rst_n) begin
+        if (!rst_n) begin: rst_5b
+            for (i=0; i<DLY; i=i+1) begin
+                gx_d[i]<=0; gy_d[i]<=0; pacx_d[i]<=0; pacy_d[i]<=0;
+                gh0x_d[i]<=0; gh0y_d[i]<=0; gh1x_d[i]<=0; gh1y_d[i]<=0;
+                gh2x_d[i]<=0; gh2y_d[i]<=0; gh3x_d[i]<=0; gh3y_d[i]<=0;
+            end
+        end else begin
+            gx_d[0] <= grid_x;   for (i=1; i<DLY; i=i+1) gx_d[i] <= gx_d[i-1];
+            gy_d[0] <= grid_y;   for (i=1; i<DLY; i=i+1) gy_d[i] <= gy_d[i-1];
+            pacx_d[0] <= pac_x;  for (i=1; i<DLY; i=i+1) pacx_d[i] <= pacx_d[i-1];
+            pacy_d[0] <= pac_y;  for (i=1; i<DLY; i=i+1) pacy_d[i] <= pacy_d[i-1];
+            gh0x_d[0] <= ghost0_x; for (i=1; i<DLY; i=i+1) gh0x_d[i] <= gh0x_d[i-1];
+            gh0y_d[0] <= ghost0_y; for (i=1; i<DLY; i=i+1) gh0y_d[i] <= gh0y_d[i-1];
+            gh1x_d[0] <= ghost1_x; for (i=1; i<DLY; i=i+1) gh1x_d[i] <= gh1x_d[i-1];
+            gh1y_d[0] <= ghost1_y; for (i=1; i<DLY; i=i+1) gh1y_d[i] <= gh1y_d[i-1];
+            gh2x_d[0] <= ghost2_x; for (i=1; i<DLY; i=i+1) gh2x_d[i] <= gh2x_d[i-1];
+            gh2y_d[0] <= ghost2_y; for (i=1; i<DLY; i=i+1) gh2y_d[i] <= gh2y_d[i-1];
+            gh3x_d[0] <= ghost3_x; for (i=1; i<DLY; i=i+1) gh3x_d[i] <= gh3x_d[i-1];
+            gh3y_d[0] <= ghost3_y; for (i=1; i<DLY; i=i+1) gh3y_d[i] <= gh3y_d[i-1];
+        end
+    end
+    wire [4:0] grid_x_r = gx_d[DLY-1], grid_y_r = gy_d[DLY-1];
+    wire [4:0] pac_x_r = pacx_d[DLY-1], pac_y_r = pacy_d[DLY-1];
+    wire [4:0] gh0_x_r = gh0x_d[DLY-1], gh0_y_r = gh0y_d[DLY-1];
+    wire [4:0] gh1_x_r = gh1x_d[DLY-1], gh1_y_r = gh1y_d[DLY-1];
+    wire [4:0] gh2_x_r = gh2x_d[DLY-1], gh2_y_r = gh2y_d[DLY-1];
+    wire [4:0] gh3_x_r = gh3x_d[DLY-1], gh3_y_r = gh3y_d[DLY-1];
+
+    // 1bit/3bit 信号延迟链
+    reg iga_d [0:DLY-1], pw_d [0:DLY-1], pb_d [0:DLY-1], ve_d [0:DLY-1];
+    reg [2:0] gs_d [0:DLY-1];
+    always @(posedge clk_100M or negedge rst_n) begin
+        if (!rst_n) begin: rst_1b
+            for (i=0; i<DLY; i=i+1) begin
+                iga_d[i]<=0; pw_d[i]<=0; pb_d[i]<=0; ve_d[i]<=0; gs_d[i]<=0;
+            end
+        end else begin
+            iga_d[0] <= in_game_area; for (i=1; i<DLY; i=i+1) iga_d[i] <= iga_d[i-1];
+            pw_d[0] <= power_active;  for (i=1; i<DLY; i=i+1) pw_d[i] <= pw_d[i-1];
+            pb_d[0] <= pill_blink;    for (i=1; i<DLY; i=i+1) pb_d[i] <= pb_d[i-1];
+            ve_d[0] <= video_en_r;    for (i=1; i<DLY; i=i+1) ve_d[i] <= ve_d[i-1];
+            gs_d[0] <= game_state;    for (i=1; i<DLY; i=i+1) gs_d[i] <= gs_d[i-1];
+        end
+    end
+    wire in_game_area_r = iga_d[DLY-1];
+    wire power_active_r = pw_d[DLY-1];
+    wire pill_blink_r   = pb_d[DLY-1];
+    wire video_en_rr    = ve_d[DLY-1];
+    wire [2:0] game_state_r = gs_d[DLY-1];
+
+    //========================================================================
+    // 8. 纹理 ROM 实例及延迟链 (吃豆人、墙壁、幽灵)
+    //========================================================================
+    wire [7:0] tex_addr = {pixel_y_r[3:0], pixel_x_r[3:0]};
+    reg [7:0] tex_addr_r;
+    always @(posedge clk_100M) if (pixel_en) tex_addr_r <= tex_addr;
+
+    // 吃豆人 ROM
+    wire [23:0] rom_pacman_raw;
+    rom_pacman u_rom_pacman (.clock(clk_100M), .address(tex_addr_r), .q(rom_pacman_raw));
+    reg [23:0] rom_pacman_dly [0:DLY-1];
+    always @(posedge clk_100M or negedge rst_n) begin
+        if (!rst_n) for (i=0; i<DLY; i=i+1) rom_pacman_dly[i] <= 0;
+        else begin
+            rom_pacman_dly[0] <= rom_pacman_raw;
+            for (i=1; i<DLY; i=i+1) rom_pacman_dly[i] <= rom_pacman_dly[i-1];
+        end
+    end
+    wire [23:0] rom_pacman_data = rom_pacman_dly[DLY-1];
+
+    // 墙壁 ROM
+    wire [23:0] rom_wall_raw;
+    rom_wall u_rom_wall (.clock(clk_100M), .address(tex_addr_r), .q(rom_wall_raw));
+    reg [23:0] rom_wall_dly [0:DLY-1];
+    always @(posedge clk_100M or negedge rst_n) begin
+        if (!rst_n) for (i=0; i<DLY; i=i+1) rom_wall_dly[i] <= 0;
+        else begin
+            rom_wall_dly[0] <= rom_wall_raw;
+            for (i=1; i<DLY; i=i+1) rom_wall_dly[i] <= rom_wall_dly[i-1];
+        end
+    end
+    wire [23:0] rom_wall_data = rom_wall_dly[DLY-1];
+
+    // 幽灵 ROM (所有幽灵共用)
+    wire [23:0] rom_ghost_raw;
+    rom_ghost u_rom_ghost (.clock(clk_100M), .address(tex_addr_r), .q(rom_ghost_raw));
+    reg [23:0] rom_ghost_dly [0:DLY-1];
+    always @(posedge clk_100M or negedge rst_n) begin
+        if (!rst_n) for (i=0; i<DLY; i=i+1) rom_ghost_dly[i] <= 0;
+        else begin
+            rom_ghost_dly[0] <= rom_ghost_raw;
+            for (i=1; i<DLY; i=i+1) rom_ghost_dly[i] <= rom_ghost_dly[i-1];
+        end
+    end
+    wire [23:0] rom_ghost_data = rom_ghost_dly[DLY-1];
+
+    //========================================================================
+    // 9. 颜色与绘制函数 (点、药丸用纯色)
+    //========================================================================
+    localparam COLOR_DOT=24'hFFD1A4, COLOR_PILL=24'hFFFFFF;
+    localparam COLOR_BG=24'h000000, COLOR_GO_BG=24'h330000, COLOR_WIN=24'h00FF00;
+
+    function [23:0] draw_dot(input [3:0] px, py);
+        begin draw_dot = (px>=4&&px<=11&&py>=4&&py<=11) ? COLOR_DOT : COLOR_BG; end
+    endfunction
+
+    function [23:0] draw_pill(input [3:0] px, py, input blink);
+        begin
+            if (blink) draw_pill = (px>=1&&px<=14&&py>=1&&py<=14) ? COLOR_PILL : COLOR_BG;
+            else       draw_pill = (px>=5&&px<=10&&py>=5&&py<=10) ? COLOR_PILL : COLOR_BG;
+        end
+    endfunction
+
+    //========================================================================
+    // 10. 渲染输出 (使用纹理)
+    //========================================================================
+    always @(*) begin
+        vga_r = 0; vga_g = 0; vga_b = 0;
+        if (!video_en_rr) begin
+            // 消隐区
+        end else begin
+            case (game_state_r)
+                `STATE_IDLE: begin
+                    if (in_game_area_r)
+                        {vga_r,vga_g,vga_b} = (vga_map_data_r==`MAP_WALL) ? rom_wall_data : COLOR_BG;
+                    else {vga_r,vga_g,vga_b} = COLOR_BG;
+                end
+                `STATE_GAME_OVER: begin
+                    if (in_game_area_r)
+                        {vga_r,vga_g,vga_b} = (vga_map_data_r==`MAP_WALL) ? rom_wall_data : COLOR_GO_BG;
+                    else {vga_r,vga_g,vga_b} = COLOR_BG;
+                end
+                `STATE_DEAD: begin
+                    if (in_game_area_r) begin
+                        case (vga_map_data_r)
+                            `MAP_EMPTY: {vga_r,vga_g,vga_b}=COLOR_BG;
+                            `MAP_DOT:   {vga_r,vga_g,vga_b}=draw_dot(pixel_x_r[3:0],pixel_y_r[3:0]);
+                            `MAP_PILL:  {vga_r,vga_g,vga_b}=draw_pill(pixel_x_r[3:0],pixel_y_r[3:0],pill_blink_r);
+                            `MAP_WALL:  {vga_r,vga_g,vga_b}=rom_wall_data;
+                            default:    {vga_r,vga_g,vga_b}=COLOR_BG;
+                        endcase
+                    end else {vga_r,vga_g,vga_b}=COLOR_BG;
+                end
+                `STATE_WIN: begin
+                    if (in_game_area_r) begin
+                        case (vga_map_data_r)
+                            `MAP_WALL: {vga_r,vga_g,vga_b}=rom_wall_data;
+                            `MAP_DOT:  {vga_r,vga_g,vga_b}=draw_dot(pixel_x_r[3:0],pixel_y_r[3:0]);
+                            `MAP_PILL: {vga_r,vga_g,vga_b}=draw_pill(pixel_x_r[3:0],pixel_y_r[3:0],pill_blink_r);
+                            default:   {vga_r,vga_g,vga_b}=COLOR_WIN;
+                        endcase
+                    end else {vga_r,vga_g,vga_b}=COLOR_BG;
+                end
+                `STATE_PLAYING, `STATE_POWER_MODE: begin
+                    if (in_game_area_r) begin
+                        // 吃豆人优先
+                        if (grid_x_r==pac_x_r && grid_y_r==pac_y_r) begin
+                            {vga_r,vga_g,vga_b} = rom_pacman_data;
+                        end
+                        // 幽灵 (纹理，能量模式下仍显示原纹理)
+                        else if (grid_x_r==gh0_x_r && grid_y_r==gh0_y_r) begin
+                            {vga_r,vga_g,vga_b} = rom_ghost_data;
+                        end
+                        else if (grid_x_r==gh1_x_r && grid_y_r==gh1_y_r) begin
+                            {vga_r,vga_g,vga_b} = rom_ghost_data;
+                        end
+                        else if (grid_x_r==gh2_x_r && grid_y_r==gh2_y_r) begin
+                            {vga_r,vga_g,vga_b} = rom_ghost_data;
+                        end
+                        else if (grid_x_r==gh3_x_r && grid_y_r==gh3_y_r) begin
+                            {vga_r,vga_g,vga_b} = rom_ghost_data;
+                        end
+                        else begin
+                            case (vga_map_data_r)
+                                `MAP_EMPTY: {vga_r,vga_g,vga_b}=COLOR_BG;
+                                `MAP_DOT:   {vga_r,vga_g,vga_b}=draw_dot(pixel_x_r[3:0],pixel_y_r[3:0]);
+                                `MAP_PILL:  {vga_r,vga_g,vga_b}=draw_pill(pixel_x_r[3:0],pixel_y_r[3:0],pill_blink_r);
+                                `MAP_WALL:  {vga_r,vga_g,vga_b}=rom_wall_data;
+                                default:    {vga_r,vga_g,vga_b}=COLOR_BG;
+                            endcase
+                        end
+                    end else {vga_r,vga_g,vga_b}=COLOR_BG;
+                end
+                default: {vga_r,vga_g,vga_b}=24'hFF0000;
+            endcase
+        end
+    end
+
+endmodule

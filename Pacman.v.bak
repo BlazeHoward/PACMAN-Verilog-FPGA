@@ -1,0 +1,108 @@
+`timescale 1ns / 1ps
+`include "game_defines.v"
+
+module PacMan (
+    input  wire       clk,
+    input  wire       rst_n,
+    input  wire       move_en,
+    input  wire [1:0] key_dir,
+    input  wire [2:0] next_map_data,
+    input  wire       reset_pos,
+    input  wire [4:0] spawn_x,   // 动态出生点 X
+    input  wire [4:0] spawn_y,   // 动态出生点 Y
+    output reg  [4:0] pac_x,
+    output reg  [4:0] pac_y,
+    output wire [4:0] next_x,
+    output wire [4:0] next_y,
+    output reg        move_req,
+    output reg        dot_eat,
+    output reg        pill_eat
+);
+
+    localparam BLOCK_SHIFT = 4;
+    localparam BLOCK_SIZE   = 1 << BLOCK_SHIFT;
+
+    reg [9:0] pixel_x;
+    reg [8:0] pixel_y;
+    reg [1:0] buffered_dir;
+    reg [1:0] current_dir;
+    reg [1:0] reset_hold;
+
+    wire [9:0] next_pixel_x = (buffered_dir == `DIR_LEFT) ? pixel_x - BLOCK_SIZE :
+                               (buffered_dir == `DIR_RIGHT)? pixel_x + BLOCK_SIZE : pixel_x;
+    wire [8:0] next_pixel_y = (buffered_dir == `DIR_UP)   ? pixel_y - BLOCK_SIZE :
+                               (buffered_dir == `DIR_DOWN) ? pixel_y + BLOCK_SIZE : pixel_y;
+
+    assign next_x = next_pixel_x >> BLOCK_SHIFT;
+    assign next_y = next_pixel_y >> BLOCK_SHIFT;
+
+    wire at_grid_center = (pixel_x[BLOCK_SHIFT-1:0] == 0) && (pixel_y[BLOCK_SHIFT-1:0] == 0);
+    wire can_move = (next_map_data != `MAP_WALL);
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            reset_hold <= 0;
+        else if (reset_pos)
+            reset_hold <= 2;
+        else if (reset_hold > 0)
+            reset_hold <= reset_hold - 1;
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pixel_x      <= (spawn_x << BLOCK_SHIFT);
+            pixel_y      <= (spawn_y << BLOCK_SHIFT);
+            buffered_dir <= `DIR_UP;
+            current_dir  <= `DIR_UP;
+            pac_x        <= spawn_x;
+            pac_y        <= spawn_y;
+            move_req     <= 0;
+            dot_eat      <= 0;
+            pill_eat     <= 0;
+        end else if (reset_pos) begin
+            pixel_x      <= (spawn_x << BLOCK_SHIFT);
+            pixel_y      <= (spawn_y << BLOCK_SHIFT);
+            buffered_dir <= `DIR_UP;
+            current_dir  <= `DIR_UP;
+            pac_x        <= spawn_x;
+            pac_y        <= spawn_y;
+            move_req     <= 0;
+            dot_eat      <= 0;
+            pill_eat     <= 0;
+        end else begin
+            move_req <= 0;
+            dot_eat  <= 0;
+            pill_eat <= 0;
+
+            if (reset_hold > 0)
+                buffered_dir <= `DIR_UP;
+            else
+                buffered_dir <= key_dir;
+
+            if (move_en) begin
+                if (at_grid_center) begin
+                    if (can_move) begin
+                        current_dir <= buffered_dir;
+                        pixel_x     <= next_pixel_x;
+                        pixel_y     <= next_pixel_y;
+                        pac_x       <= next_x;
+                        pac_y       <= next_y;
+                        move_req    <= 1;
+                        if (next_map_data == `MAP_DOT)  dot_eat  <= 1;
+                        if (next_map_data == `MAP_PILL) pill_eat <= 1;
+                    end
+                end else begin
+                    if (current_dir != 0) begin
+                        case (current_dir)
+                            `DIR_UP:    begin pixel_y <= pixel_y - BLOCK_SIZE;  pac_y <= pac_y - 1; move_req <= 1; end
+                            `DIR_DOWN:  begin pixel_y <= pixel_y + BLOCK_SIZE;  pac_y <= pac_y + 1; move_req <= 1; end
+                            `DIR_LEFT:  begin pixel_x <= pixel_x - BLOCK_SIZE;  pac_x <= pac_x - 1; move_req <= 1; end
+                            `DIR_RIGHT: begin pixel_x <= pixel_x + BLOCK_SIZE;  pac_x <= pac_x + 1; move_req <= 1; end
+                        endcase
+                    end
+                end
+            end
+        end
+    end
+
+endmodule

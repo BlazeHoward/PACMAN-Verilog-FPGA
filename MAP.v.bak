@@ -1,0 +1,384 @@
+`timescale 1ns / 1ps
+`ifndef GAME_DEFINES_1
+`include "game_defines.v"
+`endif
+
+module MAP #(
+    parameter MAX_WIDTH  = 19,
+    parameter MAX_HEIGHT = 21
+)(
+    input  wire        clk_100M,
+    input  wire        rst_n,
+    input  wire [1:0]  difficulty,
+
+    output reg  [4:0]  curr_width,
+    output reg  [4:0]  curr_height,
+
+    input  wire [4:0]  vga_rd_x,
+    input  wire [4:0]  vga_rd_y,
+    output wire [2:0]  vga_rd_data,
+
+    input  wire        logic_en,
+    input  wire        logic_wr_en,
+    input  wire [4:0]  logic_addr_x,
+    input  wire [4:0]  logic_addr_y,
+    output wire [2:0]  logic_rd_data,
+
+    input  wire        refresh_pulse,
+    input  wire [15:0] random_seed,
+    output wire        refresh_done,
+
+    output reg  [4:0]  pac_spawn_x,
+    output reg  [4:0]  pac_spawn_y,
+    output reg  [4:0]  ghost_spawn_x,
+    output reg  [4:0]  ghost_spawn_y
+);
+
+    //========================================================================
+    // 1. 难度参数寄存
+    //========================================================================
+    reg [1:0] diff_reg;
+    always @(posedge clk_100M or negedge rst_n) begin
+        if (!rst_n) diff_reg <= 2'd0;
+        else        diff_reg <= difficulty;
+    end
+
+    // 出生点和尺寸
+    always @(posedge clk_100M or negedge rst_n) begin
+        if (!rst_n) begin
+            curr_width    <= 5'd8;  curr_height   <= 5'd8;
+            pac_spawn_x   <= 5'd3;  pac_spawn_y   <= 5'd3;
+            ghost_spawn_x <= 5'd4;  ghost_spawn_y <= 5'd3;
+        end else begin
+            case (diff_reg)
+                2'd2: begin
+                    curr_width    <= 5'd19; curr_height   <= 5'd21;
+                    pac_spawn_x   <= 5'd9;  pac_spawn_y   <= 5'd9;
+                    ghost_spawn_x <= 5'd9;  ghost_spawn_y <= 5'd8;
+                end
+                2'd1: begin
+                    curr_width    <= 5'd15; curr_height   <= 5'd15;
+                    pac_spawn_x   <= 5'd7;  pac_spawn_y   <= 5'd7;
+                    ghost_spawn_x <= 5'd7;  ghost_spawn_y <= 5'd6;
+                end
+                default: begin
+                    curr_width    <= 5'd8;  curr_height   <= 5'd8;
+                    pac_spawn_x   <= 5'd3;  pac_spawn_y   <= 5'd3;
+                    ghost_spawn_x <= 5'd4;  ghost_spawn_y <= 5'd3;
+                end
+            endcase
+        end
+    end
+
+    //========================================================================
+    // 2. 地址计算参数
+    //========================================================================
+    localparam MAP_SIMPLE_BASE = 0;
+    localparam MAP_MED_BASE    = 64;
+    localparam MAP_HARD_BASE   = 289;
+    localparam MAP_TOTAL_CELLS = 688;
+
+    //========================================================================
+    // 3. BRAM存储器
+    //========================================================================
+    (* ramstyle = "M9K, no_rw_check" *) reg [2:0] rom_mem [0:MAP_TOTAL_CELLS-1];
+    initial $readmemh("maze_map.hex", rom_mem);
+
+    //========================================================================
+    // 4. 流水线地址计算
+    //========================================================================
+    wire [4:0] vga_y_factor = (diff_reg == 2'd2) ? 5'd19 :
+                               (diff_reg == 2'd1) ? 5'd15 : 5'd8;
+    wire [4:0] logic_y_factor = (diff_reg == 2'd2) ? 5'd19 :
+                                 (diff_reg == 2'd1) ? 5'd15 : 5'd8;
+
+    wire [8:0] vga_local_addr_comb  = vga_rd_y * vga_y_factor + vga_rd_x;
+    wire [8:0] logic_local_addr_comb = logic_addr_y * logic_y_factor + logic_addr_x;
+
+    reg [8:0] vga_local_addr_p1;
+    reg [8:0] logic_local_addr_p1;
+    always @(posedge clk_100M) begin
+        vga_local_addr_p1  <= vga_local_addr_comb;
+        logic_local_addr_p1 <= logic_local_addr_comb;
+    end
+
+    wire [9:0] vga_addr_comb  = (diff_reg == 2'd2) ? (MAP_HARD_BASE + vga_local_addr_p1) :
+                                 (diff_reg == 2'd1) ? (MAP_MED_BASE + vga_local_addr_p1) :
+                                                      (MAP_SIMPLE_BASE + vga_local_addr_p1);
+    wire [9:0] logic_addr_comb = (diff_reg == 2'd2) ? (MAP_HARD_BASE + logic_local_addr_p1) :
+                                  (diff_reg == 2'd1) ? (MAP_MED_BASE + logic_local_addr_p1) :
+                                                       (MAP_SIMPLE_BASE + logic_local_addr_p1);
+
+    reg [9:0] vga_addr_reg;
+    reg [9:0] logic_addr_reg;
+    always @(posedge clk_100M) begin
+        vga_addr_reg   <= vga_addr_comb;
+        logic_addr_reg <= logic_addr_comb;
+    end
+
+    //========================================================================
+    // 5. 流水线第3级
+    //========================================================================
+    reg [2:0] rom_data_vga_p3;
+    reg [2:0] rom_data_logic_p3;
+    reg       overlay_bit_vga_p3;
+    reg       overlay_bit_logic_p3;
+    reg       vga_valid_p3;
+    reg       logic_valid_p3;
+    always @(posedge clk_100M) begin
+        rom_data_vga_p3   <= rom_mem[vga_addr_reg];
+        rom_data_logic_p3 <= rom_mem[logic_addr_reg];
+        overlay_bit_vga_p3   <= overlay[vga_local_addr_p1];
+        overlay_bit_logic_p3 <= overlay[logic_local_addr_p1];
+        vga_valid_p3   <= (vga_rd_x < curr_width) && (vga_rd_y < curr_height);
+        logic_valid_p3 <= (logic_addr_x < curr_width) && (logic_addr_y < curr_height) && logic_en;
+    end
+
+    //========================================================================
+    // 6. Overlay 寄存器及辅助函数
+    //========================================================================
+    localparam OVERLAY_SIZE = 19 * 21;
+    reg [OVERLAY_SIZE-1:0] overlay;
+
+    function [8:0] get_local_addr;
+        input [1:0] diff;
+        input [4:0] x;
+        input [4:0] y;
+        reg [8:0] tmp;
+        begin
+            case (diff)
+                2'd2: tmp = (y << 4) + (y << 1) + y + x;
+                2'd1: tmp = (y << 4) - y + x;
+                default: tmp = (y << 3) + x;
+            endcase
+            get_local_addr = tmp;
+        end
+    endfunction
+
+    task init_overlay;
+        input [1:0] diff;
+        begin
+            overlay = 0;
+            case (diff)
+                2'd1: begin
+                    overlay[get_local_addr(2'd1, 5'd2,  5'd2)]  = 1;
+                    overlay[get_local_addr(2'd1, 5'd12, 5'd2)]  = 1;
+                    overlay[get_local_addr(2'd1, 5'd2,  5'd12)] = 1;
+                    overlay[get_local_addr(2'd1, 5'd12, 5'd12)] = 1;
+                end
+                2'd2: begin
+                    overlay[get_local_addr(2'd2, 5'd3,  5'd3)]  = 1;
+                    overlay[get_local_addr(2'd2, 5'd15, 5'd3)]  = 1;
+                    overlay[get_local_addr(2'd2, 5'd3,  5'd17)] = 1;
+                    overlay[get_local_addr(2'd2, 5'd15, 5'd17)] = 1;
+                    overlay[get_local_addr(2'd2, 5'd9,  5'd5)]  = 1;
+                    overlay[get_local_addr(2'd2, 5'd9,  5'd15)] = 1;
+                end
+                default: overlay = 0;
+            endcase
+        end
+    endtask
+
+    // 药丸坐标查找函数
+    function [4:0] get_med_pill_x; input [1:0] idx;
+        begin
+            case (idx)
+                2'd0: get_med_pill_x = 5'd2;
+                2'd1: get_med_pill_x = 5'd12;
+                2'd2: get_med_pill_x = 5'd2;
+                2'd3: get_med_pill_x = 5'd12;
+            endcase
+        end
+    endfunction
+    function [4:0] get_med_pill_y; input [1:0] idx;
+        begin
+            case (idx)
+                2'd0: get_med_pill_y = 5'd2;
+                2'd1: get_med_pill_y = 5'd2;
+                2'd2: get_med_pill_y = 5'd12;
+                2'd3: get_med_pill_y = 5'd12;
+            endcase
+        end
+    endfunction
+    function [4:0] get_hard_pill_x; input [2:0] idx;
+        begin
+            case (idx)
+                3'd0: get_hard_pill_x = 5'd3;
+                3'd1: get_hard_pill_x = 5'd15;
+                3'd2: get_hard_pill_x = 5'd3;
+                3'd3: get_hard_pill_x = 5'd15;
+                3'd4: get_hard_pill_x = 5'd9;
+                3'd5: get_hard_pill_x = 5'd9;
+                default: get_hard_pill_x = 5'd3;
+            endcase
+        end
+    endfunction
+    function [4:0] get_hard_pill_y; input [2:0] idx;
+        begin
+            case (idx)
+                3'd0: get_hard_pill_y = 5'd3;
+                3'd1: get_hard_pill_y = 5'd3;
+                3'd2: get_hard_pill_y = 5'd17;
+                3'd3: get_hard_pill_y = 5'd17;
+                3'd4: get_hard_pill_y = 5'd5;
+                3'd5: get_hard_pill_y = 5'd15;
+                default: get_hard_pill_y = 5'd3;
+            endcase
+        end
+    endfunction
+
+    //========================================================================
+    // 7. 刷新状态机 (不再直接操作 overlay)
+    //========================================================================
+    reg refresh_wr_en;
+    reg [8:0] refresh_addr;
+    reg refresh_busy;
+    reg refresh_done_reg;
+    reg [2:0] refresh_state;
+    localparam REF_IDLE=0, REF_CLEAR=1, REF_GEN_RAND=2, REF_WRITE=3, REF_DONE=4;
+
+    reg [1:0] med_pill_idx;
+    reg [2:0] hard_pill_rand;
+    reg [15:0] lfsr;
+    wire lfsr_fb = lfsr[15] ^ lfsr[13] ^ lfsr[12] ^ lfsr[10];
+
+    always @(posedge clk_100M or negedge rst_n) begin
+        if (!rst_n) begin
+            refresh_wr_en    <= 0;
+            refresh_addr     <= 0;
+            refresh_busy     <= 0;
+            refresh_done_reg <= 0;
+            refresh_state    <= REF_IDLE;
+            med_pill_idx     <= 0;
+            hard_pill_rand   <= 0;
+            lfsr             <= 16'hACE1;
+            // 注意：overlay 初始化已移至 overlay 写操作 always 块，此处不再调用 init_overlay
+        end else begin
+            lfsr <= {lfsr[14:0], lfsr_fb};
+
+            case (diff_reg)
+                2'd0: begin
+                    refresh_busy     <= 0;
+                    refresh_done_reg <= 0;   // 简单难度下刷新永远不完成（或根据需要改为脉冲）
+                    refresh_state    <= REF_IDLE;
+                    refresh_wr_en    <= 0;
+                end
+
+                2'd1: begin
+                    case (refresh_state)
+                        REF_IDLE: begin
+                            refresh_wr_en    <= 0;
+                            refresh_done_reg <= 0;
+                            if (refresh_pulse && !refresh_busy) begin
+                                refresh_state <= REF_CLEAR;
+                                refresh_busy  <= 1;
+                            end
+                        end
+                        REF_CLEAR: begin
+                            refresh_addr <= get_local_addr(2'd1,
+                                                           get_med_pill_x(med_pill_idx),
+                                                           get_med_pill_y(med_pill_idx));
+                            refresh_wr_en <= 1;
+                            refresh_state <= REF_GEN_RAND;
+                        end
+                        REF_GEN_RAND: begin
+                            med_pill_idx <= (med_pill_idx == 2'd3) ? 2'd0 : med_pill_idx + 1;
+                            refresh_state <= REF_WRITE;
+                        end
+                        REF_WRITE: begin
+                            refresh_addr <= get_local_addr(2'd1,
+                                                           get_med_pill_x(med_pill_idx),
+                                                           get_med_pill_y(med_pill_idx));
+                            refresh_wr_en <= 1;
+                            refresh_state <= REF_DONE;
+                        end
+                        REF_DONE: begin
+                            refresh_wr_en    <= 0;
+                            refresh_done_reg <= 1;
+                            refresh_busy     <= 0;
+                            refresh_state    <= REF_IDLE;
+                        end
+                    endcase
+                end
+
+                2'd2: begin
+                    case (refresh_state)
+                        REF_IDLE: begin
+                            refresh_wr_en    <= 0;
+                            refresh_done_reg <= 0;
+                            if (refresh_pulse && !refresh_busy) begin
+                                hard_pill_rand <= lfsr[2:0];
+                                refresh_state  <= REF_CLEAR;
+                                refresh_busy   <= 1;
+                            end
+                        end
+                        REF_CLEAR: begin
+                            refresh_addr <= get_local_addr(2'd2,
+                                                           get_hard_pill_x(hard_pill_rand),
+                                                           get_hard_pill_y(hard_pill_rand));
+                            refresh_wr_en <= 1;
+                            refresh_state <= REF_GEN_RAND;
+                        end
+                        REF_GEN_RAND: begin
+                            hard_pill_rand <= lfsr[2:0];
+                            refresh_state <= REF_WRITE;
+                        end
+                        REF_WRITE: begin
+                            refresh_addr <= get_local_addr(2'd2,
+                                                           get_hard_pill_x(hard_pill_rand),
+                                                           get_hard_pill_y(hard_pill_rand));
+                            refresh_wr_en <= 1;
+                            refresh_state <= REF_DONE;
+                        end
+                        REF_DONE: begin
+                            refresh_wr_en    <= 0;
+                            refresh_done_reg <= 1;
+                            refresh_busy     <= 0;
+                            refresh_state    <= REF_IDLE;
+                        end
+                    endcase
+                end
+            endcase
+        end
+    end
+    assign refresh_done = refresh_done_reg;
+
+    //========================================================================
+    // 8. Overlay 写操作 (唯一驱动 overlay 的 always 块)
+    //========================================================================
+    wire [8:0] overlay_logic_addr = get_local_addr(diff_reg, logic_addr_x, logic_addr_y);
+    wire [8:0] overlay_refresh_addr = refresh_addr;
+
+    always @(posedge clk_100M or negedge rst_n) begin
+        if (!rst_n) begin
+            init_overlay(difficulty);   // 复位时初始化一次
+        end else begin
+            if (logic_en && logic_wr_en && overlay_logic_addr < OVERLAY_SIZE)
+                overlay[overlay_logic_addr] <= 1;   // 逻辑写: 标记为已吃
+            else if (refresh_wr_en && overlay_refresh_addr < OVERLAY_SIZE)
+                overlay[overlay_refresh_addr] <= 0; // 刷新: 重新出现药丸
+        end
+    end
+
+    //========================================================================
+    // 9. 流水线第4级: merge 输出
+    //========================================================================
+    reg [2:0] vga_rd_data_reg;
+    reg [2:0] logic_rd_data_reg;
+
+    wire vga_replace_empty = overlay_bit_vga_p3 || 
+                             (rom_data_vga_p3 == `MAP_PAC_SPAWN) || 
+                             (rom_data_vga_p3 == `MAP_GHOST_SPAWN);
+    wire logic_replace_empty = overlay_bit_logic_p3 || 
+                               (rom_data_logic_p3 == `MAP_PAC_SPAWN) || 
+                               (rom_data_logic_p3 == `MAP_GHOST_SPAWN);
+
+    always @(posedge clk_100M) begin
+        vga_rd_data_reg   <= vga_valid_p3 ? (vga_replace_empty ? `MAP_EMPTY : rom_data_vga_p3) : `MAP_EMPTY;
+        logic_rd_data_reg <= logic_valid_p3 ? (logic_replace_empty ? `MAP_EMPTY : rom_data_logic_p3) : `MAP_EMPTY;
+    end
+
+    assign vga_rd_data   = vga_rd_data_reg;
+    assign logic_rd_data = logic_rd_data_reg;
+
+endmodule

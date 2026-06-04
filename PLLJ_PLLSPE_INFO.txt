@@ -1,0 +1,5 @@
+PLL_Name	ClockPLL:u_pll|pll_ip_core:u_pll_ip|altpll:altpll_component|pll_ip_core_altpll:auto_generated|pll1
+PLLJITTER	30
+PLLSPEmax	84
+PLLSPEmin	-53
+

@@ -1,0 +1,447 @@
+`timescale 1ns / 1ps
+`include "game_defines.v"
+
+module GameTop (
+    // 外部接口
+    input  wire        clk_50M,
+    input  wire        rst_n,
+    // 方向按键 (低有效)
+    input  wire        key_up,
+    input  wire        key_down,
+    input  wire        key_left,
+    input  wire        key_right,
+    // 开始/暂停拨动开关 (高电平有效，上升沿触发)
+    input  wire        sw_start,
+    input  wire        sw_pause,
+    input  wire [1:0]  difficulty,
+    // VGA 输出
+    output wire        vga_clk_out,   // 25MHz 连续像素时钟
+    output wire        vga_hs,
+    output wire        vga_vs,
+    output wire        vga_blank_n,
+    output wire        vga_sync_n,
+    output wire [7:0]  vga_r,
+    output wire [7:0]  vga_g,
+    output wire [7:0]  vga_b,
+    // 七段数码管输出
+    output wire [6:0]  seg,
+    output wire [7:0]  an
+);
+
+    //============================================================
+    // 时钟与复位
+    //============================================================
+    wire clk_25M, clk_100M, clk_sys, pll_locked;
+    ClockPLL u_pll (
+        .clk_50M  (clk_50M),
+        .rst_n    (rst_n),
+        .clk_25M  (clk_25M),
+        .clk_100M (clk_100M),
+        .clk_sys  (clk_sys),
+        .locked   (pll_locked)
+    );
+    wire sys_rst_n = rst_n & pll_locked;
+
+    assign vga_clk_out = clk_25M;
+
+    //============================================================
+    // 游戏 Tick (约 15Hz)
+    //============================================================
+    reg [23:0] tick_cnt;
+    reg        move_en;
+    always @(posedge clk_100M or negedge sys_rst_n) begin
+        if (!sys_rst_n) begin
+            tick_cnt <= 0;
+            move_en  <= 0;
+        end else if (tick_cnt >= 24'd6_666_666 - 1) begin
+            tick_cnt <= 0;
+            move_en  <= 1;
+        end else begin
+            tick_cnt <= tick_cnt + 1;
+            move_en  <= 0;
+        end
+    end
+
+    //============================================================
+    // 按键输入 (方向键仍为按键，开始/暂停为拨动开关)
+    //============================================================
+    wire [1:0] key_dir;
+    wire start_pulse, pause_pulse;
+    Input_Controller u_input (
+        .clk           (clk_100M),
+        .rst_n         (sys_rst_n),
+        .key_raw_up    (key_up),
+        .key_raw_down  (key_down),
+        .key_raw_left  (key_left),
+        .key_raw_right (key_right),
+        .sw_start      (sw_start),   // 拨动开关
+        .sw_pause      (sw_pause),   // 拨动开关
+        .dir_out       (key_dir),
+        .start_pulse   (start_pulse),
+        .pause_pulse   (pause_pulse)
+    );
+
+    //============================================================
+    // LFSR 随机数
+    //============================================================
+    wire [15:0] random_num;
+    LFSR u_lfsr (
+        .clk       (clk_100M),
+        .rst_n     (sys_rst_n),
+        .enable    (1'b1),
+        .seed      (16'd0),
+        .random_num(random_num)
+    );
+
+    //============================================================
+    // 迷宫地图 (MAP)
+    //============================================================
+    wire [4:0] curr_width, curr_height;
+    wire [4:0] vga_addr_x, vga_addr_y;
+    wire [2:0] vga_map_data;
+    wire [2:0] logic_rd_data;
+    wire       refresh_done;
+    wire [4:0] pac_spawn_x, pac_spawn_y;
+    wire [4:0] ghost_spawn_x, ghost_spawn_y;
+
+    MAP u_map (
+        .clk_100M     (clk_100M),
+        .rst_n        (sys_rst_n),
+        .difficulty   (difficulty),
+        .curr_width   (curr_width),
+        .curr_height  (curr_height),
+        .vga_rd_x     (vga_addr_x),
+        .vga_rd_y     (vga_addr_y),
+        .vga_rd_data  (vga_map_data),
+        .logic_en     (logic_en),
+        .logic_wr_en  (1'b0),
+        .logic_addr_x (logic_addr_x),
+        .logic_addr_y (logic_addr_y),
+        .logic_rd_data(logic_rd_data),
+        .refresh_pulse(refresh_pulse),
+        .random_seed  (random_num),
+        .refresh_done (refresh_done),
+        .pac_spawn_x  (pac_spawn_x),
+        .pac_spawn_y  (pac_spawn_y),
+        .ghost_spawn_x(ghost_spawn_x),
+        .ghost_spawn_y(ghost_spawn_y)
+    );
+
+    //============================================================
+    // 地图数据读取轮询
+    //============================================================
+    reg [2:0] rd_sel;
+    always @(posedge clk_100M or negedge sys_rst_n) begin
+        if (!sys_rst_n) rd_sel <= 0;
+        else rd_sel <= rd_sel + 1'b1;
+    end
+
+    reg        logic_en;
+    reg [4:0]  logic_addr_x, logic_addr_y;
+    always @(*) begin
+        logic_en = 1'b1;
+        case (rd_sel)
+            3'd0: begin logic_addr_x = pac_next_x; logic_addr_y = pac_next_y; end
+            3'd1: begin logic_addr_x = ghost0_next_x; logic_addr_y = ghost0_next_y; end
+            3'd2: begin logic_addr_x = ghost1_next_x; logic_addr_y = ghost1_next_y; end
+            3'd3: begin logic_addr_x = ghost2_next_x; logic_addr_y = ghost2_next_y; end
+            3'd4: begin logic_addr_x = ghost3_next_x; logic_addr_y = ghost3_next_y; end
+            default: begin logic_en = 1'b0; logic_addr_x = 0; logic_addr_y = 0; end
+        endcase
+    end
+
+    localparam MAP_DLY = 4;
+    reg [2:0] pac_map_dly [0:MAP_DLY-1];
+    reg [2:0] gh0_map_dly [0:MAP_DLY-1];
+    reg [2:0] gh1_map_dly [0:MAP_DLY-1];
+    reg [2:0] gh2_map_dly [0:MAP_DLY-1];
+    reg [2:0] gh3_map_dly [0:MAP_DLY-1];
+    integer i;
+    always @(posedge clk_100M or negedge sys_rst_n) begin
+        if (!sys_rst_n) begin
+            for (i=0; i<MAP_DLY; i=i+1) begin
+                pac_map_dly[i] <= 0;
+                gh0_map_dly[i] <= 0;
+                gh1_map_dly[i] <= 0;
+                gh2_map_dly[i] <= 0;
+                gh3_map_dly[i] <= 0;
+            end
+        end else begin
+            pac_map_dly[0] <= (rd_sel == 3'd0) ? logic_rd_data : pac_map_dly[0];
+            gh0_map_dly[0] <= (rd_sel == 3'd1) ? logic_rd_data : gh0_map_dly[0];
+            gh1_map_dly[0] <= (rd_sel == 3'd2) ? logic_rd_data : gh1_map_dly[0];
+            gh2_map_dly[0] <= (rd_sel == 3'd3) ? logic_rd_data : gh2_map_dly[0];
+            gh3_map_dly[0] <= (rd_sel == 3'd4) ? logic_rd_data : gh3_map_dly[0];
+            for (i=1; i<MAP_DLY; i=i+1) begin
+                pac_map_dly[i] <= pac_map_dly[i-1];
+                gh0_map_dly[i] <= gh0_map_dly[i-1];
+                gh1_map_dly[i] <= gh1_map_dly[i-1];
+                gh2_map_dly[i] <= gh2_map_dly[i-1];
+                gh3_map_dly[i] <= gh3_map_dly[i-1];
+            end
+        end
+    end
+    wire [2:0] pac_map_data = pac_map_dly[MAP_DLY-1];
+    wire [2:0] gh0_map_data = gh0_map_dly[MAP_DLY-1];
+    wire [2:0] gh1_map_data = gh1_map_dly[MAP_DLY-1];
+    wire [2:0] gh2_map_data = gh2_map_dly[MAP_DLY-1];
+    wire [2:0] gh3_map_data = gh3_map_dly[MAP_DLY-1];
+
+    //============================================================
+    // PacMan 模块 (带动态出生点)
+    //============================================================
+    wire [4:0] pac_x, pac_y;
+    wire [4:0] pac_next_x, pac_next_y;
+    wire       pac_move_req;
+    wire       dot_eat, pill_eat;
+    PacMan u_pacman (
+        .clk          (clk_100M),
+        .rst_n        (sys_rst_n),
+        .move_en      (move_en),
+        .key_dir      (key_dir),
+        .next_map_data(pac_map_data),
+        .reset_pos    (reset_pac),
+        .spawn_x      (pac_spawn_x),
+        .spawn_y      (pac_spawn_y),
+        .pac_x        (pac_x),
+        .pac_y        (pac_y),
+        .next_x       (pac_next_x),
+        .next_y       (pac_next_y),
+        .move_req     (pac_move_req),
+        .dot_eat      (dot_eat),
+        .pill_eat     (pill_eat)
+    );
+
+    //============================================================
+    // 幽灵模块 (x4，带动态出生点)
+    //============================================================
+    wire [4:0] ghost0_x, ghost0_y, ghost0_next_x, ghost0_next_y;
+    wire       ghost0_move_req;
+    wire [4:0] ghost1_x, ghost1_y, ghost1_next_x, ghost1_next_y;
+    wire       ghost1_move_req;
+    wire [4:0] ghost2_x, ghost2_y, ghost2_next_x, ghost2_next_y;
+    wire       ghost2_move_req;
+    wire [4:0] ghost3_x, ghost3_y, ghost3_next_x, ghost3_next_y;
+    wire       ghost3_move_req;
+
+    Ghost u_ghost0 (
+        .clk          (clk_100M),
+        .rst_n        (sys_rst_n),
+        .move_en      (move_en),
+        .ai_mode      (1'b1),
+        .pac_x        (pac_x),
+        .pac_y        (pac_y),
+        .random_num   (random_num),
+        .power_active (power_active),
+        .reset_pos    (reset_ghost0),
+        .next_map_data(gh0_map_data),
+        .curr_width   (curr_width),
+        .curr_height  (curr_height),
+        .spawn_x      (ghost_spawn_x),
+        .spawn_y      (ghost_spawn_y),
+        .ghost_x      (ghost0_x),
+        .ghost_y      (ghost0_y),
+        .next_x       (ghost0_next_x),
+        .next_y       (ghost0_next_y),
+        .move_req     (ghost0_move_req)
+    );
+
+    Ghost u_ghost1 (
+        .clk          (clk_100M),
+        .rst_n        (sys_rst_n),
+        .move_en      (move_en),
+        .ai_mode      (1'b1),
+        .pac_x        (pac_x),
+        .pac_y        (pac_y),
+        .random_num   (random_num),
+        .power_active (power_active),
+        .reset_pos    (reset_ghost1),
+        .next_map_data(gh1_map_data),
+        .curr_width   (curr_width),
+        .curr_height  (curr_height),
+        .spawn_x      (ghost_spawn_x),
+        .spawn_y      (ghost_spawn_y),
+        .ghost_x      (ghost1_x),
+        .ghost_y      (ghost1_y),
+        .next_x       (ghost1_next_x),
+        .next_y       (ghost1_next_y),
+        .move_req     (ghost1_move_req)
+    );
+
+    Ghost u_ghost2 (
+        .clk          (clk_100M),
+        .rst_n        (sys_rst_n),
+        .move_en      (move_en),
+        .ai_mode      (1'b1),
+        .pac_x        (pac_x),
+        .pac_y        (pac_y),
+        .random_num   (random_num),
+        .power_active (power_active),
+        .reset_pos    (reset_ghost2),
+        .next_map_data(gh2_map_data),
+        .curr_width   (curr_width),
+        .curr_height  (curr_height),
+        .spawn_x      (ghost_spawn_x),
+        .spawn_y      (ghost_spawn_y),
+        .ghost_x      (ghost2_x),
+        .ghost_y      (ghost2_y),
+        .next_x       (ghost2_next_x),
+        .next_y       (ghost2_next_y),
+        .move_req     (ghost2_move_req)
+    );
+
+    Ghost u_ghost3 (
+        .clk          (clk_100M),
+        .rst_n        (sys_rst_n),
+        .move_en      (move_en),
+        .ai_mode      (1'b1),
+        .pac_x        (pac_x),
+        .pac_y        (pac_y),
+        .random_num   (random_num),
+        .power_active (power_active),
+        .reset_pos    (reset_ghost3),
+        .next_map_data(gh3_map_data),
+        .curr_width   (curr_width),
+        .curr_height  (curr_height),
+        .spawn_x      (ghost_spawn_x),
+        .spawn_y      (ghost_spawn_y),
+        .ghost_x      (ghost3_x),
+        .ghost_y      (ghost3_y),
+        .next_x       (ghost3_next_x),
+        .next_y       (ghost3_next_y),
+        .move_req     (ghost3_move_req)
+    );
+
+    //============================================================
+    // 碰撞检测与事件生成
+    //============================================================
+    reg pac_death;
+    reg ghost_eat;
+    reg reset_pac;
+    reg reset_ghost0, reset_ghost1, reset_ghost2, reset_ghost3;
+
+    always @(posedge clk_100M or negedge sys_rst_n) begin
+        if (!sys_rst_n) begin
+            pac_death <= 0;
+            ghost_eat <= 0;
+            reset_pac <= 0;
+            reset_ghost0 <= 0; reset_ghost1 <= 0; reset_ghost2 <= 0; reset_ghost3 <= 0;
+        end else begin
+            pac_death <= 0;
+            ghost_eat <= 0;
+            reset_pac <= 0;
+            reset_ghost0 <= 0; reset_ghost1 <= 0; reset_ghost2 <= 0; reset_ghost3 <= 0;
+
+            if ( (pac_x == ghost0_x && pac_y == ghost0_y) ||
+                 (pac_x == ghost1_x && pac_y == ghost1_y) ||
+                 (pac_x == ghost2_x && pac_y == ghost2_y) ||
+                 (pac_x == ghost3_x && pac_y == ghost3_y) ) begin
+                if (power_active) begin
+                    ghost_eat <= 1;
+                    if (pac_x == ghost0_x && pac_y == ghost0_y) reset_ghost0 <= 1;
+                    if (pac_x == ghost1_x && pac_y == ghost1_y) reset_ghost1 <= 1;
+                    if (pac_x == ghost2_x && pac_y == ghost2_y) reset_ghost2 <= 1;
+                    if (pac_x == ghost3_x && pac_y == ghost3_y) reset_ghost3 <= 1;
+                end else begin
+                    pac_death <= 1;
+                    reset_pac <= 1;
+                end
+            end
+        end
+    end
+
+    //============================================================
+    // 分数与状态管理
+    //============================================================
+    wire       power_active;
+    wire [9:0] power_counter;
+    wire       game_win, game_over;
+    wire [2:0] game_state;
+    wire [9:0] score;
+    wire [1:0] lives;
+    wire       reset_positions;
+    wire       score_reset_pulse;
+    wire [15:0] score_bcd;
+
+    ScoreManager u_score (
+        .clk             (clk_100M),
+        .rst_n           (sys_rst_n),
+        .difficulty      (difficulty),
+        .dot_eat         (dot_eat),
+        .pill_eat        (pill_eat),
+        .ghost_eat       (ghost_eat),
+        .pac_death       (pac_death),
+        .power_active    (power_active),
+        .power_counter   (power_counter),
+        .game_win        (game_win),
+        .game_over       (game_over),
+        .game_state      (game_state),
+        .score           (score),
+        .lives           (lives),
+        .reset_positions (reset_positions),
+        .score_reset_pulse(score_reset_pulse),
+        .score_bcd       (score_bcd)
+    );
+
+    always @(posedge clk_100M or negedge sys_rst_n) begin
+        if (!sys_rst_n) begin
+            // 已在复位块中
+        end else begin
+            if (reset_positions) begin
+                reset_pac <= 1;
+                reset_ghost0 <= 1; reset_ghost1 <= 1; reset_ghost2 <= 1; reset_ghost3 <= 1;
+            end
+        end
+    end
+
+    wire pill_blink = power_active;
+    reg pill_eat_r;
+    wire refresh_pulse = pill_eat && !pill_eat_r;
+    always @(posedge clk_100M) pill_eat_r <= pill_eat;
+
+    //============================================================
+    // VGA 渲染
+    //============================================================
+    VGA_Renderer u_vga (
+        .clk_100M      (clk_100M),
+        .rst_n         (sys_rst_n),
+        .difficulty    (difficulty),
+        .vga_addr_x    (vga_addr_x),
+        .vga_addr_y    (vga_addr_y),
+        .vga_map_data  (vga_map_data),
+        .pac_x         (pac_x),
+        .pac_y         (pac_y),
+        .ghost0_x      (ghost0_x),
+        .ghost0_y      (ghost0_y),
+        .ghost1_x      (ghost1_x),
+        .ghost1_y      (ghost1_y),
+        .ghost2_x      (ghost2_x),
+        .ghost2_y      (ghost2_y),
+        .ghost3_x      (ghost3_x),
+        .ghost3_y      (ghost3_y),
+        .power_active  (power_active),
+        .pill_blink    (pill_blink),
+        .game_state    (game_state),
+        .vga_clk_out   (),          // 悬空
+        .vga_hs        (vga_hs),
+        .vga_vs        (vga_vs),
+        .vga_blank_n   (vga_blank_n),
+        .vga_sync_n    (vga_sync_n),
+        .vga_r         (vga_r),
+        .vga_g         (vga_g),
+        .vga_b         (vga_b)
+    );
+
+    //============================================================
+    // 七段数码管显示
+    //============================================================
+    SevenSegDisplay u_seg (
+        .clk       (clk_100M),
+        .rst_n     (sys_rst_n),
+        .score_bcd (score_bcd),
+        .lives     (lives),
+        .seg       (seg),
+        .an        (an)
+    );
+
+endmodule

@@ -1,0 +1,60 @@
+`ifndef GAME_DEFINES_1
+`define GAME_DEFINES_1
+
+//====================================================
+// 游戏全局宏定义 — 全组强制统一
+//====================================================
+
+//--------------------
+// 游戏全局状态编码 (3位，共8态)
+//--------------------
+`define STATE_IDLE        3'd0
+`define STATE_PLAYING     3'd1
+`define STATE_POWER_MODE  3'd2
+`define STATE_DEAD        3'd3
+`define STATE_WIN         3'd4
+`define STATE_GAME_OVER   3'd5
+`define STATE_MENU        3'd6   // 新增：菜单选难度
+`define STATE_READY       3'd7   // 新增：准备开始
+
+//--------------------
+// 地图瓦片数据编码 (3位)
+//--------------------
+`define MAP_EMPTY       3'b000
+`define MAP_DOT         3'b001
+`define MAP_PILL        3'b010
+`define MAP_WALL        3'b011
+`define MAP_GHOST_SPAWN 3'b100
+`define MAP_PAC_SPAWN   3'b101
+
+//--------------------
+// 方向编码 (2位)
+//--------------------
+`define DIR_UP    2'b00
+`define DIR_DOWN  2'b01
+`define DIR_LEFT  2'b10
+`define DIR_RIGHT 2'b11
+
+//--------------------
+// 简单难度配置
+//--------------------
+`define CFG_LIVES          2'd3
+`define CFG_POWER_DURATION 10'd90
+`define CFG_SCORE_DOT      10'd10
+`define CFG_SCORE_PILL     10'd50
+`define CFG_SCORE_GHOST    10'd200
+
+//--------------------
+// 像素与网格转换
+// 注意：BLOCK_SIZE=8 是角色移动步长
+// VGA 贴图尺寸由 VGA_Renderer 内部 TILE_SIZE=16 独立控制
+//--------------------
+`define BLOCK_SIZE  4'd8
+`define BLOCK_SHIFT 3'd3
+
+//--------------------
+// 游戏Tick分频参数 (50MHz -> ~15Hz)
+//--------------------
+`define TICK_DIV 24'd3_333_333
+
+`endif

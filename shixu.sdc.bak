@@ -1,0 +1,23 @@
+# ============================================================================
+# SDC 时序约束文件 - 针对 MAP 模块 (修正版)
+# ============================================================================
+
+# 1. 创建主时钟 (100MHz, 周期 10ns)
+create_clock -name clk_100M -period 10.000 [get_ports clk_100M]
+
+# 2. 自动派生所有 PLL 生成的时钟
+derive_pll_clocks
+
+# 3. 自动计算时钟不确定性
+derive_clock_uncertainty
+
+# 4. 设置输入延迟 (排除时钟和复位)
+set_input_delay -clock clk_100M -max 2.0 [remove_from_collection [all_inputs] [get_ports {clk_100M rst_n}]]
+set_input_delay -clock clk_100M -min 0.5 [remove_from_collection [all_inputs] [get_ports {clk_100M rst_n}]]
+
+# 5. 设置输出延迟
+set_output_delay -clock clk_100M -max 2.0 [all_outputs]
+set_output_delay -clock clk_100M -min 0.5 [all_outputs]
+
+# 6. 设置伪路径 (异步复位)
+set_false_path -from [get_ports rst_n]

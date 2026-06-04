@@ -1,0 +1,240 @@
+`timescale 1ns / 1ps
+`include "game_defines.v"
+
+//====================================================
+// BCD转换子模块
+//====================================================
+module bin_to_bcd (
+    input  [9:0]  bin,
+    output [15:0] bcd
+);
+    reg [15:0] bcd_reg;
+    reg [9:0]  bin_reg;
+    integer i;
+    
+    always @(*) begin
+        bcd_reg = 16'd0;
+        bin_reg = bin;
+        for (i = 0; i < 10; i = i + 1) begin
+            if (bcd_reg[3:0]  >= 4'd5) bcd_reg[3:0]  = bcd_reg[3:0]  + 4'd3;
+            if (bcd_reg[7:4]  >= 4'd5) bcd_reg[7:4]  = bcd_reg[7:4]  + 4'd3;
+            if (bcd_reg[11:8] >= 4'd5) bcd_reg[11:8] = bcd_reg[11:8] + 4'd3;
+            if (bcd_reg[15:12]>= 4'd5) bcd_reg[15:12]= bcd_reg[15:12]+ 4'd3;
+            bcd_reg = {bcd_reg[14:0], bin_reg[9]};
+            bin_reg = bin_reg << 1;
+        end
+    end
+    
+    assign bcd = bcd_reg;
+endmodule
+
+
+//====================================================
+// ScoreManager 主模块（适配 100MHz 时钟，动态难度阈值）
+//====================================================
+module ScoreManager (
+    input  wire       clk,
+    input  wire       rst_n,
+    input  wire [1:0] difficulty,
+    
+    input  wire       dot_eat,
+    input  wire       pill_eat,
+    input  wire       ghost_eat,
+    input  wire       pac_death,
+    
+    output wire       power_active,
+    output wire [9:0] power_counter,
+    output wire       game_win,
+    output wire       game_over,
+    output wire [2:0] game_state,
+    
+    output wire [9:0] score,
+    output wire [1:0] lives,
+    output wire       reset_positions,
+    output wire       score_reset_pulse,
+    
+    output wire [15:0] score_bcd
+);
+
+    //------------------------------------------------------------------------
+    // 时钟分频参数：100MHz -> 约 15Hz 游戏 Tick
+    // 原宏 `TICK_DIV` 为 3_333_333 (50MHz)，现根据实际时钟重新定义内部参数
+    // 不修改宏文件，直接在模块内计算
+    //------------------------------------------------------------------------
+    localparam TICK_DIV_100M = 24'd6_666_666;   // 100MHz 下产生 ~15Hz
+    reg [23:0] tick_cnt;
+    reg        game_tick;
+    
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            tick_cnt  <= 24'd0;
+            game_tick <= 1'b0;
+        end else if (tick_cnt >= TICK_DIV_100M - 1) begin
+            tick_cnt  <= 24'd0;
+            game_tick <= 1'b1;
+        end else begin
+            tick_cnt  <= tick_cnt + 1'b1;
+            game_tick <= 1'b0;
+        end
+    end
+
+    //------------------------------------------------------------------------
+    // 内部寄存器
+    //------------------------------------------------------------------------
+    reg [2:0] state;
+    reg [9:0] score_reg;
+    reg [1:0] lives_reg;
+    reg [9:0] power_cnt;
+    reg       power_act;
+    reg       reset_pos;
+    reg       score_rst;
+    reg       win_reg;
+    reg       over_reg;
+    
+    // 组合输出
+    assign game_state      = state;
+    assign score           = score_reg;
+    assign lives           = lives_reg;
+    assign power_active    = power_act;
+    assign power_counter   = power_cnt;
+    assign game_win        = win_reg;
+    assign game_over       = over_reg;
+    assign reset_positions = reset_pos;
+    assign score_reset_pulse = score_rst;
+    
+    // BCD转换
+    bin_to_bcd bcd_inst (
+        .bin(score_reg),
+        .bcd(score_bcd)
+    );
+    
+    //------------------------------------------------------------------------
+    // 动态胜利阈值（根据难度，不修改宏）
+    //------------------------------------------------------------------------
+    wire [9:0] win_threshold;
+    assign win_threshold = (difficulty == 2'd0) ? 10'd370 :   // 简单: 约32豆+1药=370
+                           (difficulty == 2'd1) ? 10'd800 :   // 中等: 预估值，可后续精确
+                           (difficulty == 2'd2) ? 10'd1200 :  // 困难: 预估值
+                           10'd370;
+    
+    //------------------------------------------------------------------------
+    // 主状态机
+    //------------------------------------------------------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state     <= `STATE_IDLE;
+            score_reg <= 10'd0;
+            lives_reg <= `CFG_LIVES;
+            power_cnt <= 10'd0;
+            power_act <= 1'b0;
+            reset_pos <= 1'b0;
+            score_rst <= 1'b1;
+            win_reg   <= 1'b0;
+            over_reg  <= 1'b0;
+        end else begin
+            // 默认脉冲清零
+            reset_pos <= 1'b0;
+            score_rst <= 1'b0;
+            win_reg   <= 1'b0;
+            over_reg  <= 1'b0;
+            
+            // 能量倒计时（game_tick 频率）
+            if (game_tick && power_act && power_cnt > 0)
+                power_cnt <= power_cnt - 1'b1;
+            
+            case (state)
+                `STATE_IDLE: begin
+                    score_reg <= 10'd0;
+                    lives_reg <= `CFG_LIVES;
+                    power_cnt <= 10'd0;
+                    power_act <= 1'b0;
+                    score_rst <= 1'b1;      // 只置1一个周期，但注意状态机可能多次进入IDLE？需要保证单周期
+                    
+                    if (dot_eat || pill_eat) begin
+                        state     <= `STATE_PLAYING;
+                        score_rst <= 1'b0;
+                        if (dot_eat)  score_reg <= score_reg + `CFG_SCORE_DOT;
+                        if (pill_eat) begin
+                            score_reg <= score_reg + `CFG_SCORE_PILL;
+                            power_act <= 1'b1;
+                            power_cnt <= `CFG_POWER_DURATION;
+                        end
+                    end
+                end
+                
+                `STATE_PLAYING: begin
+                    if (dot_eat)  score_reg <= score_reg + `CFG_SCORE_DOT;
+                    if (pill_eat) begin
+                        score_reg <= score_reg + `CFG_SCORE_PILL;
+                        power_act <= 1'b1;
+                        power_cnt <= `CFG_POWER_DURATION;
+                    end
+                    
+                    if (ghost_eat && power_act)
+                        score_reg <= score_reg + `CFG_SCORE_GHOST;
+                    
+                    if (power_act && power_cnt == 0)
+                        power_act <= 1'b0;
+                    
+                    if (power_act)
+                        state <= `STATE_POWER_MODE;
+                    
+                    if (score_reg >= win_threshold) begin
+                        state   <= `STATE_WIN;
+                        win_reg <= 1'b1;
+                    end
+                    
+                    if (pac_death && !power_act) begin
+                        if (lives_reg > 1) begin
+                            lives_reg <= lives_reg - 1'b1;
+                            state     <= `STATE_DEAD;
+                            reset_pos <= 1'b1;
+                        end else begin
+                            lives_reg <= 2'd0;
+                            state     <= `STATE_GAME_OVER;
+                            over_reg  <= 1'b1;
+                        end
+                    end
+                end
+                
+                `STATE_POWER_MODE: begin
+                    if (dot_eat)  score_reg <= score_reg + `CFG_SCORE_DOT;
+                    if (pill_eat) begin
+                        score_reg <= score_reg + `CFG_SCORE_PILL;
+                        power_cnt <= `CFG_POWER_DURATION;
+                    end
+                    
+                    if (ghost_eat && power_act)
+                        score_reg <= score_reg + `CFG_SCORE_GHOST;
+                    
+                    if (power_cnt == 0 && game_tick) begin
+                        power_act <= 1'b0;
+                        state     <= `STATE_PLAYING;
+                    end
+                    
+                    if (score_reg >= win_threshold) begin
+                        state   <= `STATE_WIN;
+                        win_reg <= 1'b1;
+                    end
+                end
+                
+                `STATE_DEAD: begin
+                    state <= `STATE_PLAYING;
+                end
+                
+                `STATE_WIN: begin
+                    if (dot_eat || pill_eat)
+                        state <= `STATE_IDLE;
+                end
+                
+                `STATE_GAME_OVER: begin
+                    if (dot_eat || pill_eat)
+                        state <= `STATE_IDLE;
+                end
+                
+                default: state <= `STATE_IDLE;
+            endcase
+        end
+    end
+
+endmodule

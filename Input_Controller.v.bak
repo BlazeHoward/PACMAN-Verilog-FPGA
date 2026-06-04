@@ -1,0 +1,72 @@
+`timescale 1ns / 1ps
+
+module Input_Controller (
+    input wire        clk,
+    input wire        rst_n,
+    input wire        key_raw_up,
+    input wire        key_raw_down,
+    input wire        key_raw_left,
+    input wire        key_raw_right,
+    input wire        key_raw_start,
+    input wire        key_raw_pause,
+    output reg  [1:0] dir_out,
+    output reg        start_pulse,
+    output reg        pause_pulse
+);
+
+    // 方向编码
+    localparam DIR_UP    = 2'd0;
+    localparam DIR_DOWN  = 2'd1;
+    localparam DIR_LEFT  = 2'd2;
+    localparam DIR_RIGHT = 2'd3;
+
+    // 消抖计数器（100MHz 下约 10ms）
+    reg [19:0] debounce_cnt;
+    wire debounce_tick = (debounce_cnt == 20'd999_999);
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            debounce_cnt <= 20'd0;
+        else if (debounce_tick)
+            debounce_cnt <= 20'd0;
+        else
+            debounce_cnt <= debounce_cnt + 1'b1;
+    end
+
+    // 方向输出（按键低有效）
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            dir_out <= DIR_RIGHT;
+        else if (debounce_tick) begin
+            if (!key_raw_up)      dir_out <= DIR_UP;
+            else if (!key_raw_down) dir_out <= DIR_DOWN;
+            else if (!key_raw_left) dir_out <= DIR_LEFT;
+            else if (!key_raw_right)dir_out <= DIR_RIGHT;
+        end
+    end
+
+    // 开始按键脉冲（下降沿检测）
+    reg start_dly;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            start_dly   <= 1'b1;
+            start_pulse <= 1'b0;
+        end else begin
+            start_dly <= key_raw_start;
+            start_pulse <= start_dly && !key_raw_start;
+        end
+    end
+
+    // 暂停按键脉冲
+    reg pause_dly;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pause_dly   <= 1'b1;
+            pause_pulse <= 1'b0;
+        end else begin
+            pause_dly <= key_raw_pause;
+            pause_pulse <= pause_dly && !key_raw_pause;
+        end
+    end
+
+endmodule

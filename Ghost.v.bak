@@ -1,0 +1,87 @@
+`timescale 1ns / 1ps
+`include "game_defines.v"
+
+module Ghost (
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire        move_en,
+    input  wire        ai_mode,
+    input  wire [4:0]  pac_x,
+    input  wire [4:0]  pac_y,
+    input  wire [15:0] random_num,
+    input  wire        power_active,
+    input  wire        reset_pos,
+    input  wire [2:0]  next_map_data,
+    input  wire [4:0]  curr_width,
+    input  wire [4:0]  curr_height,
+    input  wire [4:0]  spawn_x,   // 动态出生点 X
+    input  wire [4:0]  spawn_y,   // 动态出生点 Y
+    output reg  [4:0]  ghost_x,
+    output reg  [4:0]  ghost_y,
+    output reg  [4:0]  next_x,
+    output reg  [4:0]  next_y,
+    output reg         move_req
+);
+
+    localparam DIR_UP    = 2'd0;
+    localparam DIR_DOWN  = 2'd1;
+    localparam DIR_LEFT  = 2'd2;
+    localparam DIR_RIGHT = 2'd3;
+    localparam MAP_WALL  = 3'd1;
+
+    reg [1:0] dir;
+
+    // AI 方向选择
+    always @(*) begin
+        if (ai_mode) begin
+            if (power_active) begin
+                if (ghost_x > pac_x)      dir = DIR_RIGHT;
+                else if (ghost_x < pac_x) dir = DIR_LEFT;
+                else if (ghost_y > pac_y) dir = DIR_DOWN;
+                else                      dir = DIR_UP;
+            end else begin
+                if (ghost_x > pac_x)      dir = DIR_LEFT;
+                else if (ghost_x < pac_x) dir = DIR_RIGHT;
+                else if (ghost_y > pac_y) dir = DIR_UP;
+                else                      dir = DIR_DOWN;
+            end
+        end else begin
+            dir = random_num[1:0];
+        end
+    end
+
+    // 下一坐标计算
+    always @(*) begin
+        next_x = ghost_x;
+        next_y = ghost_y;
+        case (dir)
+            DIR_UP:    if (ghost_y > 0)            next_y = ghost_y - 1;
+            DIR_DOWN:  if (ghost_y < curr_height-1) next_y = ghost_y + 1;
+            DIR_LEFT:  if (ghost_x > 0)            next_x = ghost_x - 1;
+            DIR_RIGHT: if (ghost_x < curr_width-1)  next_x = ghost_x + 1;
+        endcase
+    end
+
+    // 移动控制
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            ghost_x <= spawn_x;
+            ghost_y <= spawn_y;
+            move_req <= 1'b0;
+        end else if (reset_pos) begin
+            ghost_x <= spawn_x;
+            ghost_y <= spawn_y;
+            move_req <= 1'b0;
+        end else begin
+            move_req <= 1'b0;
+            if (move_en) begin
+                if (next_map_data != MAP_WALL) begin
+                    ghost_x <= next_x;
+                    ghost_y <= next_y;
+                    move_req <= 1'b1;
+                end
+            end
+        end
+    end
+
+endmodule
